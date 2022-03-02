@@ -1,5 +1,5 @@
 # Create a builder image with the compilers, etc. needed
-FROM cblmariner.azurecr.io/base/core:1.0.20210224 AS build-env
+FROM cblmariner.azurecr.io/base/core:1.0.20220226 AS build-env
 
 # Install all the required packages for building. This list is probably
 # longer than necessary.
@@ -329,7 +329,8 @@ RUN if [ -z "$SYSTEMDISTRO_DEBUG_BUILD" ] ; then \
         rpm -e --nodeps pkg-config               \
         rpm -e --nodeps vim                      \
         rpm -e --nodeps wget                     \
-        rpm -e --nodeps python3;                 \
+        rpm -e --nodeps python3                  \
+        rpm -e --nodeps python3-libs;            \
     else                                         \
         echo "== Install development aid packages ==" && \
         tdnf install -y                          \
@@ -339,6 +340,12 @@ RUN if [ -z "$SYSTEMDISTRO_DEBUG_BUILD" ] ; then \
              wayland-debuginfo                   \
              xorg-x11-server-debuginfo;          \
     fi
+
+# Clear the tdnf cache to make the image smaller
+RUN tdnf clean all
+
+# Remove extra doc
+RUN rm -rf /usr/lib/python3.7 /usr/share/gtk-doc
 
 # Create wslg user.
 RUN useradd -u 1000 --create-home wslg && \

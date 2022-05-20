@@ -13,7 +13,6 @@ constexpr auto c_userName = "wslg";
 constexpr auto c_vmIdEnv = "WSL2_VM_ID";
 
 constexpr auto c_dbusDir = "/var/run/dbus";
-constexpr auto c_launchPulse = "/home/wslg/launch_pulse.sh";
 constexpr auto c_versionFile = "/etc/versions.txt";
 constexpr auto c_versionMount = SHARE_PATH "/versions.txt";
 constexpr auto c_shareDocsDir = "/usr/share/doc";
@@ -78,6 +77,25 @@ std::string TranslateWindowsPath(const char * Path)
     THROW_ERRNO_IF(EINVAL, pclose(pipe.release()) != 0);
 
     return result;
+}
+
+bool GetEnvBool(const char *EnvName, bool DefaultValue)
+{
+	char *s;
+
+	s = getenv(EnvName);
+	if (s) {
+		if (strcmp(s, "true") == 0)
+			return true;
+		else if (strcmp(s, "false") == 0)
+			return false;
+		else if (strcmp(s, "1") == 0)
+			return true;
+		else if (strcmp(s, "0") == 0)
+			return false;
+	}
+
+	return DefaultValue;
 }
 
 void SetupOptionalEnv()
@@ -329,7 +347,8 @@ try {
     }
 
     std::string rdpClientExePath = c_mstscFullPath;
-    if (isWslInstallPathEnvPresent) {
+    bool isUseMstsc = GetEnvBool("WSLG_USE_MSTSC", false);
+    if (!isUseMstsc && isWslInstallPathEnvPresent) {
         std::string msrdcExePath = TranslateWindowsPath(wslInstallPath.c_str());
         msrdcExePath += "/" MSRDC_EXE;
         if (access(msrdcExePath.c_str(), X_OK) == 0) {

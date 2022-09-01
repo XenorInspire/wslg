@@ -7,8 +7,13 @@
 #include "WSLDVCCallback.h"
 #include "WSLDVCFileDB.h"
 
+#ifdef WSLG_INBOX
 LPCWSTR c_WSL_exe = L"%windir%\\system32\\wsl.exe";
 LPCWSTR c_WSLg_exe = L"%windir%\\system32\\wslg.exe";
+#else
+LPCWSTR c_WSLg_exe = L"%localappdata%\\Microsoft\\WindowsApps\\MicrosoftCorporationII.WindowsSubsystemForLinux_8wekyb3d8bbwe\\wslg.exe";
+#endif // WSLG_INBOX
+
 LPCWSTR c_Working_dir = L"%windir%\\system32";
 
 //
@@ -302,10 +307,10 @@ public:
             return hr;
         }
 
-        // Add all files under menu and icon path at sync start.
+        // Add all files under menu path at sync start.
+        // This will also adds icon file pointed by .lnk file.
         // Any files not reported during sync, will be removed at end.
         m_spFileDBSync->addAllFilesAsFileIdAt(m_appMenuPath);
-        m_spFileDBSync->addAllFilesAsFileIdAt(m_iconPath);
 
         return S_OK;
     }
@@ -356,77 +361,25 @@ public:
         }
 
         memcpy(m_appProvider, m_serverCaps.appListProviderName, m_serverCaps.appListProviderNameLength);
-        if (wcsstr(m_appProvider, L"..") != NULL)
+        if ((wcsstr(m_appProvider, L"..") != NULL) ||
+            (wcsstr(m_appProvider, L"\"") != NULL) ||
+            (wcsstr(m_appProvider, L" ") != NULL))
         {
-            DebugPrint(L"group name can't contain \"..\" %s\n", m_appProvider);
+            DebugPrint(L"provider name can't contain '..', '\"' or space, %s\n", m_appProvider);
             return E_FAIL;
         }
 
+        hr = BuildMenuPath(ARRAYSIZE(m_appMenuPath), m_appMenuPath, m_appProvider, true);
+        if (FAILED(hr))
         {
-            PWSTR appMenuPath = NULL; // free by CoTaskMemFree. 
-            SHGetKnownFolderPath(FOLDERID_StartMenu, 0, NULL, &appMenuPath);
-            if (!appMenuPath)
-            {
-                DebugPrint(L"SHGetKnownFolderPath(FOLDERID_StartMenu) failed\n");
-                return E_FAIL;
-            }
-            int ret = swprintf_s(m_appMenuPath, ARRAYSIZE(m_appMenuPath), L"%s\\Programs\\%s", appMenuPath, m_appProvider);
-            CoTaskMemFree(appMenuPath);
-            if (ret < 0)
-            {
-                DebugPrint(L"swprintf_s for appMenuPath failed");
-                return E_FAIL;
-            }
-        }
-
-        if (!CreateDirectoryW(m_appMenuPath, NULL))
-        {
-            if (ERROR_ALREADY_EXISTS != GetLastError())
-            {
-                DebugPrint(L"Failed to create %s\n", m_appMenuPath);
-                return E_FAIL;
-            }
+            return hr;
         }
         DebugPrint(L"AppMenuPath: %s\n", m_appMenuPath);
 
-        UINT64 lenTempPath;
-        lenTempPath = GetTempPathW(MAX_PATH, m_iconPath);
-        if (!lenTempPath)
+        hr = BuildIconPath(ARRAYSIZE(m_iconPath), m_iconPath, m_appProvider, true);
+        if (FAILED(hr))
         {
-            DebugPrint(L"GetTempPathW failed\n");
-            return E_FAIL;
-        }
-
-        if (lenTempPath + 10 +
-            (m_serverCaps.appListProviderNameLength / sizeof(WCHAR)) > ARRAYSIZE(m_iconPath))
-        {
-            DebugPrint(L"provider name length check failed, length %d\n", m_serverCaps.appListProviderNameLength);
-            return E_FAIL;
-        }
-
-        if (wcscat_s(m_iconPath, ARRAYSIZE(m_iconPath), L"WSLDVCPlugin\\") != 0)
-        {
-            return E_FAIL;
-        }
-        if (!CreateDirectoryW(m_iconPath, NULL))
-        {
-            if (ERROR_ALREADY_EXISTS != GetLastError())
-            {
-                DebugPrint(L"Failed to create %s\n", m_iconPath);
-                return E_FAIL;
-            }
-        }
-        if (wcscat_s(m_iconPath, ARRAYSIZE(m_iconPath), m_appProvider) != 0)
-        {
-            return E_FAIL;
-        }
-        if (!CreateDirectoryW(m_iconPath, NULL))
-        {
-            if (ERROR_ALREADY_EXISTS != GetLastError())
-            {
-                DebugPrint(L"Failed to create %s\n", m_iconPath);
-                return E_FAIL;
-            }
+            return hr;
         }
         DebugPrint(L"IconPath: %s\n", m_iconPath);
 
@@ -437,6 +390,7 @@ public:
         }
         DebugPrint(L"WSLg.exe: %s\n", m_expandedPathObj);
 
+#ifdef WSLG_INBOX
         if (!PathFileExistsW(m_expandedPathObj) || !IsFileTrusted(m_expandedPathObj))
         {
             if (ExpandEnvironmentStringsW(c_WSL_exe, m_expandedPathObj, ARRAYSIZE(m_expandedPathObj)) == 0)
@@ -452,6 +406,7 @@ public:
                 return E_FAIL;
             }
         }
+#endif // WSLG_INBOX
 
         if (ExpandEnvironmentStringsW(c_Working_dir, m_expandedWorkingDir, ARRAYSIZE(m_expandedWorkingDir)) == 0)
         {
@@ -564,9 +519,36 @@ public:
             }
         }
 
-        if (updateAppList.appGroupLength && (wcsstr(updateAppList.appGroup, L"..") != NULL))
+        if (updateAppList.appGroupLength)
         {
-            DebugPrint(L"group name can't contain \"..\" %s\n", updateAppList.appGroup);
+            if ((wcsstr(updateAppList.appGroup, L"..") != NULL) ||
+                (wcsstr(updateAppList.appGroup, L"\"") != NULL))
+            {
+                DebugPrint(L"group name can't contain '..' or '\"', %s\n", updateAppList.appGroup);
+                return E_FAIL;
+            }
+        }
+
+        if ((wcsstr(updateAppList.appId, L"..") != NULL) ||
+            (wcsstr(updateAppList.appId, L"\"") != NULL))
+        {
+            DebugPrint(L"app id can't contain '..' or '\"', %s\n", updateAppList.appId);
+            return E_FAIL;
+        }
+
+        if ((wcsstr(updateAppList.appDesc, L"..") != NULL) ||
+            (wcsstr(updateAppList.appDesc, L"\"") != NULL))
+        {
+            DebugPrint(L"app desc can't contain '..' or '\"', %s\n", updateAppList.appDesc);
+            return E_FAIL;
+        }
+
+        // Double quote (") is valid file/path char in Linux, but currently wsl.exe/wslg.exe
+        // can't handle to give the path contains " with --cd options, thus until this get fixed,
+        // block the path contains ".
+        if ((wcsstr(updateAppList.appWorkingDir, L"\"") != NULL))
+        {
+            DebugPrint(L"app working dir can't contain '\"', %s\n", updateAppList.appWorkingDir);
             return E_FAIL;
         }
 
@@ -575,6 +557,14 @@ public:
             if (wcscpy_s(iconPath, ARRAYSIZE(iconPath), m_iconPath) != 0)
             {
                 return E_FAIL;
+            }
+            if (!CreateDirectoryW(iconPath, NULL))
+            {
+                if (ERROR_ALREADY_EXISTS != GetLastError())
+                {
+                    DebugPrint(L"Failed to create %s\n", iconPath);
+                    return E_FAIL;
+                }
             }
             if (updateAppList.appGroupLength)
             {
@@ -604,6 +594,14 @@ public:
         {
             return E_FAIL;
         }
+        if (!CreateDirectoryW(linkPath, NULL))
+        {
+            if (ERROR_ALREADY_EXISTS != GetLastError())
+            {
+                DebugPrint(L"Failed to create %s\n", linkPath);
+                return E_FAIL;
+            }
+        }
         if (updateAppList.appGroupLength)
         {
             if ((wcscat_s(linkPath, ARRAYSIZE(linkPath), L"\\") != 0) ||
@@ -630,10 +628,17 @@ public:
             return E_FAIL;
         }
 
-        if (swprintf_s(exeArgs, ARRAYSIZE(exeArgs), L"%s -d %s %s",
-                       updateAppList.appWorkingDirLength ? updateAppList.appWorkingDir : L"~", 
+        // build wsl.exe/wslg.exe command line.
+        // -d : distro name, space is not allowed in distro name,
+        //      thus wrapping by double-quoto is not accepted by wsl.exe/wslg.exe
+        // --cd : current directory, wrap by double-quote.
+        // -- : executable path with arguments. All string after '--' will be treated as Linux command line,
+        //      thus wrapping by double-quoto is not accepted by wsl.exe/wslg.exe
+        if ((swprintf_s(exeArgs, ARRAYSIZE(exeArgs), L"-d %s --cd \"%s\" -- %s",
                        m_appProvider, 
-                       updateAppList.appExecPath) < 0)
+                       updateAppList.appWorkingDirLength ? updateAppList.appWorkingDir : L"~",
+                       updateAppList.appExecPath) < 0) ||
+            (exeArgs[0] == L'\0'))
         {
             return E_FAIL;
         }

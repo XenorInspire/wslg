@@ -1,5 +1,5 @@
 # Create a builder image with the compilers, etc. needed
-FROM mcr.microsoft.com/cbl-mariner/base/core:1.0.20220226 AS build-env
+FROM mcr.microsoft.com/cbl-mariner/base/core:2.0.20220426 AS build-env
 
 # Install all the required packages for building. This list is probably
 # longer than necessary.
@@ -7,9 +7,6 @@ RUN echo "== Install Git/CA certificates ==" && \
     tdnf install -y \
         git \
         ca-certificates
-
-RUN echo "== Install mariner-repos-ui REPO ==" && \
-    tdnf install -y mariner-repos-ui
 
 RUN echo "== Install Core dependencies ==" && \
     tdnf install -y \
@@ -20,6 +17,8 @@ RUN echo "== Install Core dependencies ==" && \
         binutils  \
         bison  \
         build-essential  \
+        cairo \
+        cairo-devel \
         clang  \
         clang-devel  \
         cmake  \
@@ -75,12 +74,12 @@ RUN echo "== Install Core dependencies ==" && \
         patch  \
         perl-XML-Parser \
         polkit-devel  \
-        python2-devel \
+        python3-devel \
         python3-mako  \
+        sed \
         sqlite-devel \
         systemd-devel  \
-        UI-cairo \
-        UI-cairo-devel \
+        tar \
         unzip  \
         vala  \
         vala-devel  \
@@ -150,7 +149,7 @@ RUN echo "== System distro build type (FreeRDP):" ${BUILDTYPE_FREERDP} " =="
 ENV DESTDIR=/work/build
 ENV PREFIX=/usr
 ENV PKG_CONFIG_PATH=${DESTDIR}${PREFIX}/lib/pkgconfig:${DESTDIR}${PREFIX}/lib/${WSLG_ARCH}-linux-gnu/pkgconfig:${DESTDIR}${PREFIX}/share/pkgconfig
-ENV C_INCLUDE_PATH=${DESTDIR}${PREFIX}/include/freerdp${FREERDP_VERSION}:${DESTDIR}${PREFIX}/include/winpr${FREERDP_VERSION}:${DESTDIR}${PREFIX}/include
+ENV C_INCLUDE_PATH=${DESTDIR}${PREFIX}/include/freerdp${FREERDP_VERSION}:${DESTDIR}${PREFIX}/include/winpr${FREERDP_VERSION}:${DESTDIR}${PREFIX}/include/wsl/stubs:${DESTDIR}${PREFIX}/include
 ENV CPLUS_INCLUDE_PATH=${C_INCLUDE_PATH}
 ENV LIBRARY_PATH=${DESTDIR}${PREFIX}/lib
 ENV LD_LIBRARY_PATH=${LIBRARY_PATH}
@@ -160,6 +159,15 @@ ENV CXX=/usr/bin/g++
 # Setup DebugInfo folder
 COPY debuginfo /work/debuginfo
 RUN chmod +x /work/debuginfo/gen_debuginfo.sh
+
+# Build DirectX-Headers
+COPY vendor/DirectX-Headers-1.0 /work/vendor/DirectX-Headers-1.0
+WORKDIR /work/vendor/DirectX-Headers-1.0
+RUN /usr/bin/meson --prefix=${PREFIX} build \
+        --buildtype=${BUILDTYPE_NODEBUGSTRIP} \
+        -Dbuild-test=false && \
+    ninja -C build -j8 install && \
+    echo 'DirectX-Headers:' `git --git-dir=/work/vendor/DirectX-Headers-1.0/.git rev-parse --verify HEAD` >> /work/versions.txt
 
 # Build mesa with the minimal options we need.
 COPY vendor/mesa /work/vendor/mesa
@@ -240,6 +248,8 @@ RUN /usr/bin/meson --prefix=${PREFIX} build \
         -Dbackend-fbdev=false \
         -Dcolor-management-colord=false \
         -Dscreenshare=false \
+        -Dsystemd=false \
+        -Dwslgd=true \
         -Dremoting=false \
         -Dpipewire=false \
         -Dshell-fullscreen=false \
@@ -289,17 +299,16 @@ RUN if [ -z "$SYSTEMDISTRO_DEBUG_BUILD" ] ; then \
 
 ## Create the distro image with just what's needed at runtime
 
-FROM mcr.microsoft.com/cbl-mariner/base/core:1.0.20220226 AS runtime
-
-RUN echo "== Install mariner-repos-ui REPO ==" && \
-    tdnf install -y mariner-repos-ui
+FROM mcr.microsoft.com/cbl-mariner/base/core:2.0.20220426 AS runtime
 
 RUN echo "== Install Core/UI Runtime Dependencies ==" && \
     tdnf    install -y \
+            cairo \
             chrony \
             dbus \
             dbus-glib \
             dhcp-client \
+            e2fsprogs \
             freefont \
             libinput \
             libjpeg-turbo \
@@ -316,8 +325,9 @@ RUN echo "== Install Core/UI Runtime Dependencies ==" && \
             iproute \
             pango \
             procps-ng \
+            rpm \
+            sed \
             tzdata \
-            UI-cairo \
             wayland-protocols-devel \
             xcursor-themes \
             xorg-x11-server-Xwayland \
@@ -327,17 +337,16 @@ RUN echo "== Install Core/UI Runtime Dependencies ==" && \
 ARG SYSTEMDISTRO_DEBUG_BUILD
 RUN if [ -z "$SYSTEMDISTRO_DEBUG_BUILD" ] ; then \
         rpm -e --nodeps curl                     \
-        rpm -e --nodeps pkg-config               \
-        rpm -e --nodeps vim                      \
-        rpm -e --nodeps wget                     \
         rpm -e --nodeps python3                  \
         rpm -e --nodeps python3-libs;            \
     else                                         \
         echo "== Install development aid packages ==" && \
         tdnf install -y                          \
              gdb                                 \
+             mariner-repos-debug                 \
              nano                                \
-             vim                                 \
+             vim                              && \
+        tdnf install -y                          \
              wayland-debuginfo                   \
              xorg-x11-server-debuginfo;          \
     fi
@@ -364,6 +373,11 @@ COPY resources/linux.png /usr/share/icons/wsl/linux.png
 # Copy the built artifacts from the build stage.
 COPY --from=dev /work/build/usr/ /usr/
 COPY --from=dev /work/build/etc/ /etc/
+
+# Append WSLg setttings to pulseaudio.
+COPY config/default_wslg.pa /etc/pulse/default_wslg.pa
+RUN cat /etc/pulse/default_wslg.pa >> /etc/pulse/default.pa
+RUN rm /etc/pulse/default_wslg.pa
 
 # Copy the licensing information for PulseAudio
 COPY --from=dev /work/vendor/pulseaudio/GPL \

@@ -7,6 +7,8 @@
 #define CONFIG_FILE ".wslgconfig"
 #define SHARE_PATH "/mnt/wslg"
 #define MSRDC_EXE "msrdc.exe"
+#define GDBSERVER_PATH "/usr/bin/gdbserver"
+#define WESTON_NOTIFY_SOCKET SHARE_PATH "/weston-notify.sock"
 
 constexpr auto c_serviceIdTemplate = "%08X-FACB-11E6-BD58-64006A7986D3";
 constexpr auto c_userName = "wslg";
@@ -30,6 +32,7 @@ constexpr auto c_sharedMemoryMountPoint = "/mnt/shared_memory";
 constexpr auto c_sharedMemoryMountPointEnv = "WSL2_SHARED_MEMORY_MOUNT_POINT";
 constexpr auto c_sharedMemoryObDirectoryPathEnv = "WSL2_SHARED_MEMORY_OB_DIRECTORY";
 
+constexpr auto c_executionAliasPathEnv = "WSL2_EXECUTION_ALIAS_PATH";
 constexpr auto c_installPathEnv = "WSL2_INSTALL_PATH";
 constexpr auto c_userProfileEnv = "WSL2_USER_PROFILE";
 constexpr auto c_systemDistroEnvSection = "system-distro-env";
@@ -43,6 +46,15 @@ void LogException(const char *message, const char *exceptionDescription) noexcep
 {
     fprintf(stderr, "<3>WSLGd: %s %s", message ? message : "Exception:", exceptionDescription);
     return;
+}
+
+bool IsNumeric(char *str)
+{
+    char* p;
+    if (!str)
+        return false;
+    strtol(str, &p, 10);
+    return *p == 0;
 }
 
 std::string ToServiceId(unsigned int port)
@@ -81,21 +93,21 @@ std::string TranslateWindowsPath(const char * Path)
 
 bool GetEnvBool(const char *EnvName, bool DefaultValue)
 {
-	char *s;
+    char *s;
 
-	s = getenv(EnvName);
-	if (s) {
-		if (strcmp(s, "true") == 0)
-			return true;
-		else if (strcmp(s, "false") == 0)
-			return false;
-		else if (strcmp(s, "1") == 0)
-			return true;
-		else if (strcmp(s, "0") == 0)
-			return false;
-	}
+    s = getenv(EnvName);
+    if (s) {
+        if (strcmp(s, "true") == 0)
+            return true;
+        else if (strcmp(s, "false") == 0)
+            return false;
+        else if (strcmp(s, "1") == 0)
+            return true;
+        else if (strcmp(s, "0") == 0)
+            return false;
+    }
 
-	return DefaultValue;
+    return DefaultValue;
 }
 
 void SetupOptionalEnv()
@@ -130,6 +142,33 @@ void SetupOptionalEnv()
 #endif // HAVE_WINPR
 
     return;
+}
+
+int SetupReadyNotify(const char *socket_path)
+{
+    struct sockaddr_un addr = {};
+    socklen_t size, name_size;
+
+    addr.sun_family = AF_LOCAL;
+    name_size = snprintf(addr.sun_path, sizeof addr.sun_path,
+                         "%s", socket_path) + 1;
+    size = offsetof(struct sockaddr_un, sun_path) + name_size;
+    unlink(addr.sun_path);
+
+    wil::unique_fd socketFd{socket(PF_LOCAL, SOCK_SEQPACKET, 0)};
+    THROW_LAST_ERROR_IF(!socketFd);
+
+    THROW_LAST_ERROR_IF(bind(socketFd.get(), reinterpret_cast<const sockaddr*>(&addr), size) < 0);
+    THROW_LAST_ERROR_IF(listen(socketFd.get(), 1) < 0);
+
+    return socketFd.release();
+}
+
+void WaitForReadyNotify(int notifyFd)
+{
+    // wait under client connects */
+    wil::unique_fd fd(accept(notifyFd, 0, 0));
+    THROW_LAST_ERROR_IF(!fd);
 }
 
 int main(int Argc, char *Argv[])
@@ -167,6 +206,12 @@ try {
     if (installPath) {
         isWslInstallPathEnvPresent = true;
         wslInstallPath = installPath;
+    }
+
+    std::string wslExecutionAliasPath;
+    auto executionAliasPath = getenv(c_executionAliasPathEnv);
+    if (executionAliasPath) {
+        wslExecutionAliasPath = executionAliasPath;
     }
 
     // Bind mount the versions.txt file which contains version numbers of the various WSLG pieces.
@@ -227,29 +272,29 @@ try {
     THROW_LAST_ERROR_IF(getsockname(socketFd.get(), reinterpret_cast<sockaddr*>(&address), &addressSize));
 
     // Set required environment variables.
-    struct envVar{ const char* name; const char* value; };
+    struct envVar{ const char* name; const char* value; bool override; };
     envVar variables[] = {
-        {"HOME", passwordEntry->pw_dir},
-        {"USER", passwordEntry->pw_name},
-        {"LOGNAME", passwordEntry->pw_name},
-        {"SHELL", passwordEntry->pw_shell},
-        {"PATH", "/usr/sbin:/usr/bin:/sbin:/bin:/usr/games"},
-        {"XDG_RUNTIME_DIR", c_xdgRuntimeDir},
-        {"WAYLAND_DISPLAY", "wayland-0"},
-        {"DISPLAY", ":0"},
-        {"XCURSOR_PATH", "/usr/share/icons"},
-        {"XCURSOR_THEME", "whiteglass"},
-        {"XCURSOR_SIZE", "16"},
-        {"PULSE_AUDIO_RDP_SINK", SHARE_PATH "/PulseAudioRDPSink"},
-        {"PULSE_AUDIO_RDP_SOURCE", SHARE_PATH "/PulseAudioRDPSource"},
-        {"USE_VSOCK", socketFdString.c_str()},
-        {"WSL2_DEFAULT_APP_ICON", "/usr/share/icons/wsl/linux.png"},
-        {"WSL2_DEFAULT_APP_OVERLAY_ICON", "/usr/share/icons/wsl/linux.png"},
-        {"WESTON_DISABLE_ABSTRACT_FD", "1"}
+        {"HOME", passwordEntry->pw_dir, true},
+        {"USER", passwordEntry->pw_name, true},
+        {"LOGNAME", passwordEntry->pw_name, true},
+        {"SHELL", passwordEntry->pw_shell, true},
+        {"PATH", "/usr/sbin:/usr/bin:/sbin:/bin:/usr/games", true},
+        {"XDG_RUNTIME_DIR", c_xdgRuntimeDir, false},
+        {"WAYLAND_DISPLAY", "wayland-0", false},
+        {"DISPLAY", ":0", false},
+        {"XCURSOR_PATH", "/usr/share/icons", false},
+        {"XCURSOR_THEME", "whiteglass", false},
+        {"XCURSOR_SIZE", "16", false},
+        {"PULSE_SERVER", SHARE_PATH "/PulseServer", false},
+        {"PULSE_AUDIO_RDP_SINK", SHARE_PATH "/PulseAudioRDPSink", false},
+        {"PULSE_AUDIO_RDP_SOURCE", SHARE_PATH "/PulseAudioRDPSource", false},
+        {"USE_VSOCK", socketFdString.c_str(), true},
+        {"WSL2_DEFAULT_APP_ICON", "/usr/share/icons/wsl/linux.png", false},
+        {"WSL2_DEFAULT_APP_OVERLAY_ICON", "/usr/share/icons/wsl/linux.png", false},
     };
 
     for (auto &var : variables) {
-        THROW_LAST_ERROR_IF(setenv(var.name, var.value, true) < 0);
+        THROW_LAST_ERROR_IF(setenv(var.name, var.value, var.override) < 0);
     }
 
     SetupOptionalEnv();
@@ -290,6 +335,10 @@ try {
         isSharedMemoryMounted = false;
     }
 
+    // Construct socket option string.
+    std::string westonSocketOption("--socket=");
+    westonSocketOption += getenv("WAYLAND_DISPLAY");
+
     // Check if weston shell override is specified.
     // Otherwise, default shell is 'rdprail-shell'.
     bool isRdprailShell;
@@ -302,10 +351,6 @@ try {
         westonShellName = westonShellEnv;
         isRdprailShell = (westonShellName.compare(c_westonRdprailShell) == 0);
     }
-
-    // Construct socket option string.
-    std::string westonSocketOption("--socket=");
-    westonSocketOption += getenv("WAYLAND_DISPLAY");
 
     // Construct shell option string.
     std::string westonShellOption("--shell=");
@@ -321,19 +366,48 @@ try {
         westonLoggerOption += c_westonRdprailShell;
     }
 
+    // Setup notify for wslgd-notify.so
+    wil::unique_fd notifyFd(SetupReadyNotify(WESTON_NOTIFY_SOCKET));
+    THROW_LAST_ERROR_IF(!notifyFd);
+
+    // Construct weston option string.
+    std::string westonArgs;
+    char *gdbServerPort = getenv("WSLG_WESTON_GDBSERVER_PORT");
+    if ((access(GDBSERVER_PATH, X_OK) == 0) && IsNumeric(gdbServerPort)) {
+        westonArgs += GDBSERVER_PATH;
+        westonArgs += " :";
+        westonArgs += gdbServerPort;
+        westonArgs += " ";
+    }
+    westonArgs += "/usr/bin/weston ";
+    westonArgs += "--backend=rdp-backend.so --modules=wslgd-notify.so --xwayland --log=" SHARE_PATH "/weston.log ";
+    westonArgs += westonSocketOption;
+    westonArgs += " ";
+    westonArgs += westonShellOption;
+    westonArgs += " ";
+    westonArgs += westonLoggerOption;
+
     // Launch weston.
     // N.B. Additional capabilities are needed to setns to the mount namespace of the user distro.
     monitor.LaunchProcess(std::vector<std::string>{
-        "/usr/bin/weston",
-        "--backend=rdp-backend.so",
-        "--xwayland",
-        std::move(westonSocketOption),
-        std::move(westonShellOption),
-        std::move(westonLoggerOption),
-        "--log=" SHARE_PATH "/weston.log"
-        },
-        std::vector<cap_value_t>{CAP_SYS_ADMIN, CAP_SYS_CHROOT, CAP_SYS_PTRACE}
-    );
+                "/usr/bin/sh",
+                "-c",
+                std::move(westonArgs)
+            },
+            std::vector<cap_value_t>{
+                CAP_SYS_ADMIN,
+                CAP_SYS_CHROOT,
+                CAP_SYS_PTRACE
+            },
+            std::vector<std::string>{
+                "WSLGD_NOTIFY_SOCKET=" WESTON_NOTIFY_SOCKET,
+                "WESTON_DISABLE_ABSTRACT_FD=1"
+            }
+        );
+
+    // Wait weston to be ready before starting RDP client, pulseaudio server.
+    WaitForReadyNotify(notifyFd.get());
+    unlink(WESTON_NOTIFY_SOCKET);
 
     // Launch the mstsc/msrdc client.
     std::string remote("/v:");
@@ -348,13 +422,21 @@ try {
 
     std::string rdpClientExePath = c_mstscFullPath;
     bool isUseMstsc = GetEnvBool("WSLG_USE_MSTSC", false);
-    if (!isUseMstsc && isWslInstallPathEnvPresent) {
-        std::string msrdcExePath = TranslateWindowsPath(wslInstallPath.c_str());
+    if (!isUseMstsc && !wslExecutionAliasPath.empty()) {
+        std::string msrdcExePath = TranslateWindowsPath(wslExecutionAliasPath.c_str());
         msrdcExePath += "/" MSRDC_EXE;
         if (access(msrdcExePath.c_str(), X_OK) == 0) {
             rdpClientExePath = std::move(msrdcExePath);
         }
     }
+
+    std::string wslDvcPlugin;
+    if (GetEnvBool("WSLG_USE_WSLDVC_PRIVATE", false))
+        wslDvcPlugin = "/plugin:WSLDVC_PRIVATE";
+    else if (isWslInstallPathEnvPresent)
+        wslDvcPlugin = "/plugin:WSLDVC_PACKAGE";
+    else
+        wslDvcPlugin = "/plugin:WSLDVC";
 
     std::string rdpFilePath = wslInstallPath + "\\wslg.rdp";
     monitor.LaunchProcess(std::vector<std::string>{
@@ -363,7 +445,7 @@ try {
         std::move(serviceId),
         "/silent",
         "/wslg",
-        isWslInstallPathEnvPresent ? "/plugin:WSLDVC_PACKAGE" : "/plugin:WSLDVC",
+        std::move(wslDvcPlugin),
         std::move(sharedMemoryObPath),
         std::move(rdpFilePath)
     });

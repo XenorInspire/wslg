@@ -18,6 +18,15 @@ void DebugPrint(const wchar_t* format, ...)
 #endif // DBG_MESSAGE
 
 _Use_decl_annotations_
+BOOL IsDirectoryPresent(LPCWSTR lpszPath)
+{
+    DWORD dwAttrib = GetFileAttributes(lpszPath);
+
+    return (dwAttrib != INVALID_FILE_ATTRIBUTES && 
+           (dwAttrib & FILE_ATTRIBUTE_DIRECTORY));
+}
+
+_Use_decl_annotations_
 HRESULT
 CreateShellLink(LPCWSTR lpszPathLink,
     LPCWSTR lpszPathObj,
@@ -75,6 +84,50 @@ CreateShellLink(LPCWSTR lpszPathLink,
     }
 
     DebugPrint(L"\tresult: %x\n", hr);
+    return hr;
+}
+
+_Use_decl_annotations_
+HRESULT
+GetIconFileFromShellLink(
+    UINT32 iconPathSize, 
+    LPWSTR iconPath,
+    LPCWSTR lnkPath)
+{
+    HRESULT hr;
+    IShellLink* psl;
+
+    DebugPrint(L"GetIconFileFromShellLink:\n");
+    DebugPrint(L"\tPath Link: %s\n", lnkPath);
+
+    assert(iconPathSize);
+    assert(iconPath);
+    *iconPath = L'\0';
+
+    hr = CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_IShellLink, (LPVOID*)&psl);
+    if (SUCCEEDED(hr))
+    {
+        IPersistFile* ppf;
+        hr = psl->QueryInterface(IID_IPersistFile, (LPVOID*)&ppf);
+        if (SUCCEEDED(hr))
+        {
+            hr = ppf->Load(lnkPath, STGM_READ);
+            if (SUCCEEDED(hr))
+            {
+                int dummy = 0;
+                hr = psl->GetIconLocation(iconPath, iconPathSize, &dummy);
+            }
+            ppf->Release();
+        }
+        psl->Release();
+    }
+
+    DebugPrint(L"\tresult: %x\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        DebugPrint(L"\ticonPath: %s\n", iconPath);
+    }
+
     return hr;
 }
 
@@ -145,6 +198,99 @@ BOOL GetLocaleName(char* localeName, int localeNameSize)
     }
 
     return TRUE;
+}
+
+_Use_decl_annotations_
+HRESULT BuildMenuPath(
+    UINT32 appMenuPathSize,
+    LPWSTR appMenuPath,
+    LPCWSTR appProvider,
+    bool isCreateDir)
+{
+    PWSTR knownFolderPath = NULL; // free by CoTaskMemFree. 
+    SHGetKnownFolderPath(FOLDERID_StartMenu, 0, NULL, &knownFolderPath);
+    if (!knownFolderPath)
+    {
+        DebugPrint(L"SHGetKnownFolderPath(FOLDERID_StartMenu) failed\n");
+        return E_FAIL;
+    }
+    int ret = swprintf_s(appMenuPath, appMenuPathSize, L"%s\\Programs\\%s", knownFolderPath, appProvider);
+    CoTaskMemFree(knownFolderPath);
+    if (ret < 0)
+    {
+        DebugPrint(L"swprintf_s for appMenuPath failed");
+        return E_FAIL;
+    }
+    if (isCreateDir)
+    {
+        if (!CreateDirectoryW(appMenuPath, NULL))
+        {
+            if (ERROR_ALREADY_EXISTS != GetLastError())
+            {
+                DebugPrint(L"Failed to create %s\n", appMenuPath);
+                return E_FAIL;
+            }
+        }
+    }
+
+    return S_OK;
+}
+
+_Use_decl_annotations_
+HRESULT BuildIconPath(
+    UINT32 iconPathSize,
+    LPWSTR iconPath,
+    LPCWSTR appProvider,
+    bool isCreateDir)
+{
+    WCHAR prefix[] = L"WSLDVCPlugin\\";
+
+    UINT32 lenTempPath;
+    lenTempPath = GetTempPathW(iconPathSize, iconPath);
+    if (!lenTempPath)
+    {
+        DebugPrint(L"GetTempPathW failed\n");
+        return E_FAIL;
+    }
+
+    if ((lenTempPath + ARRAYSIZE(prefix) + wcslen(appProvider)) > iconPathSize)
+    {
+        DebugPrint(L"provider name length check failed, length %d\n",  wcslen(appProvider));
+        return E_FAIL;
+    }
+
+    if (wcscat_s(iconPath, iconPathSize, prefix) != 0)
+    {
+        return E_FAIL;
+    }
+    if (isCreateDir)
+    {
+        if (!CreateDirectoryW(iconPath, NULL))
+        {
+            if (ERROR_ALREADY_EXISTS != GetLastError())
+            {
+                DebugPrint(L"Failed to create %s\n", iconPath);
+                return E_FAIL;
+            }
+        }
+    }
+    if (wcscat_s(iconPath, iconPathSize, appProvider) != 0)
+    {
+        return E_FAIL;
+    }
+    if (isCreateDir)
+    {
+        if (!CreateDirectoryW(iconPath, NULL))
+        {
+            if (ERROR_ALREADY_EXISTS != GetLastError())
+            {
+                DebugPrint(L"Failed to create %s\n", iconPath);
+                return E_FAIL;
+            }
+        }
+    }
+
+    return S_OK;
 }
 
 #if ENABLE_WSL_SIGNATURE_CHECK

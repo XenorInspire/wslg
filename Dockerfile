@@ -1,5 +1,5 @@
 # Create a builder image with the compilers, etc. needed
-FROM mcr.microsoft.com/cbl-mariner/base/core:2.0.20220426 AS build-env
+FROM mcr.microsoft.com/cbl-mariner/base/core:2.0.20221010 AS build-env
 
 # Install all the required packages for building. This list is probably
 # longer than necessary.
@@ -76,6 +76,7 @@ RUN echo "== Install Core dependencies ==" && \
         polkit-devel  \
         python3-devel \
         python3-mako  \
+        python3-markupsafe \
         sed \
         sqlite-devel \
         systemd-devel  \
@@ -146,6 +147,10 @@ RUN echo "== System distro build type (no debug strip):" ${BUILDTYPE_NODEBUGSTRI
 ENV BUILDTYPE_FREERDP=${BUILDTYPE_FREERDP:-RelWithDebInfo}
 RUN echo "== System distro build type (FreeRDP):" ${BUILDTYPE_FREERDP} " =="
 
+ENV WITH_DEBUG_FREERDP=${SYSTEMDISTRO_DEBUG_BUILD:+ON}
+ENV WITH_DEBUG_FREERDP=${WITH_DEBUG_FREERDP:-OFF}
+RUN echo "== System distro build type (FreeRDP Debug Options):" ${WITH_DEBUG_FREERDP} " =="
+
 ENV DESTDIR=/work/build
 ENV PREFIX=/usr
 ENV PKG_CONFIG_PATH=${DESTDIR}${PREFIX}/lib/pkgconfig:${DESTDIR}${PREFIX}/lib/${WSLG_ARCH}-linux-gnu/pkgconfig:${DESTDIR}${PREFIX}/share/pkgconfig
@@ -201,6 +206,7 @@ RUN cmake -G Ninja \
         -DCMAKE_INSTALL_PREFIX=${PREFIX} \
         -DCMAKE_INSTALL_LIBDIR=${PREFIX}/lib \
         -DCMAKE_BUILD_TYPE=${BUILDTYPE_FREERDP} \
+        -DWITH_DEBUG_ALL=${WITH_DEBUG_FREERDP} \
         -DWITH_ICU=ON \
         -DWITH_SERVER=ON \
         -DWITH_CHANNEL_GFXREDIR=ON \
@@ -299,7 +305,7 @@ RUN if [ -z "$SYSTEMDISTRO_DEBUG_BUILD" ] ; then \
 
 ## Create the distro image with just what's needed at runtime
 
-FROM mcr.microsoft.com/cbl-mariner/base/core:2.0.20220426 AS runtime
+FROM mcr.microsoft.com/cbl-mariner/base/core:2.0.20221010 AS runtime
 
 RUN echo "== Install Core/UI Runtime Dependencies ==" && \
     tdnf    install -y \

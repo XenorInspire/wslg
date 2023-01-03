@@ -6,10 +6,12 @@
 #include "FontMonitor.h"
 
 #define CONFIG_FILE ".wslgconfig"
-#define SHARE_PATH "/mnt/wslg"
 #define MSRDC_EXE "msrdc.exe"
+#define MSTSC_EXE "mstsc.exe"
 #define GDBSERVER_PATH "/usr/bin/gdbserver"
 #define WESTON_NOTIFY_SOCKET SHARE_PATH "/weston-notify.sock"
+#define DEFAULT_ICON_PATH "/usr/share/icons"
+#define USER_DISTRO_ICON_PATH USER_DISTRO_MOUNT_PATH DEFAULT_ICON_PATH
 
 constexpr auto c_serviceIdTemplate = "%08X-FACB-11E6-BD58-64006A7986D3";
 constexpr auto c_userName = "wslg";
@@ -38,14 +40,39 @@ constexpr auto c_installPathEnv = "WSL2_INSTALL_PATH";
 constexpr auto c_userProfileEnv = "WSL2_USER_PROFILE";
 constexpr auto c_systemDistroEnvSection = "system-distro-env";
 
-constexpr auto c_mstscFullPath = "/mnt/c/Windows/System32/mstsc.exe";
+constexpr auto c_windowsSystem32 = "/mnt/c/Windows/System32";
 
 constexpr auto c_westonShellOverrideEnv = "WSL2_WESTON_SHELL_OVERRIDE";
 constexpr auto c_westonRdprailShell = "rdprail-shell";
 
+constexpr auto c_rdpFileOverrideEnv = "WSL2_RDP_CONFIG_OVERRIDE";
+constexpr auto c_rdpFile = "wslg.rdp";
+
+void LogPrint(int level, const char *func, int line, const char *fmt, ...) noexcept
+{
+    std::array<char, 128> buffer;
+    struct timeval tv;
+    struct tm *time;
+    va_list va_args;
+
+    gettimeofday(&tv, NULL);
+    time = localtime(&tv.tv_sec);
+    strftime(buffer.data(), buffer.size(), "%H:%M:%S", time);
+    fprintf(stderr, "[%s.%03ld] <%d>WSLGd: %s:%u: ",
+        buffer.data(), (tv.tv_usec / 1000),
+        level, func, line);
+
+    va_start(va_args, fmt);
+    vfprintf(stderr, fmt, va_args);
+    va_end(va_args);
+    fprintf(stderr, "\n");
+
+    return;
+}
+
 void LogException(const char *message, const char *exceptionDescription) noexcept
 {
-    fprintf(stderr, "<3>WSLGd: %s %s", message ? message : "Exception:", exceptionDescription);
+    LogPrint(LOG_LEVEL_EXCEPTION, __FUNCTION__, __LINE__, "%s %s", message ? message : "Exception:", exceptionDescription);
     return;
 }
 
@@ -176,16 +203,55 @@ int main(int Argc, char *Argv[])
 try {
     wil::g_LogExceptionCallback = LogException;
 
+    // Restore default processing for SIGCHLD as both WSLGd and Xwayland depends on this.
+    signal(SIGCHLD, SIG_DFL);
+
+    // Create a process monitor to track child processes
+    wslgd::ProcessMonitor monitor(c_userName);
+    auto passwordEntry = monitor.GetUserInfo();
+
+    // Set required environment variables.
+    struct envVar{ const char* name; const char* value; bool override; };
+    envVar variables[] = {
+        {"HOME", passwordEntry->pw_dir, true},
+        {"USER", passwordEntry->pw_name, true},
+        {"LOGNAME", passwordEntry->pw_name, true},
+        {"SHELL", passwordEntry->pw_shell, true},
+        {"PATH", "/usr/sbin:/usr/bin:/sbin:/bin:/usr/games", true},
+        {"XDG_RUNTIME_DIR", c_xdgRuntimeDir, false},
+        {"WAYLAND_DISPLAY", "wayland-0", false},
+        {"DISPLAY", ":0", false},
+        {"XCURSOR_PATH", USER_DISTRO_ICON_PATH ":" DEFAULT_ICON_PATH , false},
+        {"XCURSOR_THEME", "whiteglass", false},
+        {"XCURSOR_SIZE", "16", false},
+        {"PULSE_SERVER", SHARE_PATH "/PulseServer", false},
+        {"PULSE_AUDIO_RDP_SINK", SHARE_PATH "/PulseAudioRDPSink", false},
+        {"PULSE_AUDIO_RDP_SOURCE", SHARE_PATH "/PulseAudioRDPSource", false},
+        {"WSL2_DEFAULT_APP_ICON", DEFAULT_ICON_PATH "/wsl/linux.png", false},
+        {"WSL2_DEFAULT_APP_OVERLAY_ICON", DEFAULT_ICON_PATH "/wsl/linux.png", false},
+    };
+
+    for (auto &var : variables) {
+        THROW_LAST_ERROR_IF(setenv(var.name, var.value, var.override) < 0);
+    }
+
+    SetupOptionalEnv();
+
+    // if any components output log to /dev/kmsg, make it writable.
+    if (GetEnvBool("WSLG_LOG_KMSG", false))
+        THROW_LAST_ERROR_IF(chmod("/dev/kmsg", 0666) < 0);
+
     // Open a file for logging errors and set it to stderr for WSLGd as well as any child process.
     {
-        wil::unique_fd stdErrLogFd(open(c_stdErrLogFile, (O_RDWR | O_CREAT), (S_IRUSR | S_IRGRP | S_IROTH)));
+        const char *errLog = getenv("WSLG_ERR_LOG_PATH");
+        if (!errLog) {
+            errLog = c_stdErrLogFile;
+        }
+        wil::unique_fd stdErrLogFd(open(errLog, (O_RDWR | O_CREAT), (S_IRUSR | S_IRGRP | S_IROTH)));
         if (stdErrLogFd && (stdErrLogFd.get() != STDERR_FILENO)) {
             dup2(stdErrLogFd.get(), STDERR_FILENO);
         }
     }
-
-    // Restore default processing for SIGCHLD as both WSLGd and Xwayland depends on this.
-    signal(SIGCHLD, SIG_DFL);
 
     // Ensure the daemon is launched as root.
     if (geteuid() != 0) {
@@ -225,10 +291,6 @@ try {
 
     std::filesystem::create_directories(c_shareDocsMount);
     THROW_LAST_ERROR_IF(mount(c_shareDocsDir, c_shareDocsMount, NULL, MS_BIND | MS_RDONLY, NULL) < 0);
-
-    // Create a process monitor to track child processes
-    wslgd::ProcessMonitor monitor(c_userName);
-    auto passwordEntry = monitor.GetUserInfo();
 
     // Create a font folder monitor
     wslgd::FontMonitor fontMonitor;
@@ -274,40 +336,18 @@ try {
     THROW_LAST_ERROR_IF(bind(socketFd.get(), reinterpret_cast<const sockaddr*>(&address), addressSize) < 0);
     THROW_LAST_ERROR_IF(listen(socketFd.get(), 1) < 0);
     THROW_LAST_ERROR_IF(getsockname(socketFd.get(), reinterpret_cast<sockaddr*>(&address), &addressSize));
-
-    // Set required environment variables.
-    struct envVar{ const char* name; const char* value; bool override; };
-    envVar variables[] = {
-        {"HOME", passwordEntry->pw_dir, true},
-        {"USER", passwordEntry->pw_name, true},
-        {"LOGNAME", passwordEntry->pw_name, true},
-        {"SHELL", passwordEntry->pw_shell, true},
-        {"PATH", "/usr/sbin:/usr/bin:/sbin:/bin:/usr/games", true},
-        {"XDG_RUNTIME_DIR", c_xdgRuntimeDir, false},
-        {"WAYLAND_DISPLAY", "wayland-0", false},
-        {"DISPLAY", ":0", false},
-        {"XCURSOR_PATH", "/usr/share/icons", false},
-        {"XCURSOR_THEME", "whiteglass", false},
-        {"XCURSOR_SIZE", "16", false},
-        {"PULSE_SERVER", SHARE_PATH "/PulseServer", false},
-        {"PULSE_AUDIO_RDP_SINK", SHARE_PATH "/PulseAudioRDPSink", false},
-        {"PULSE_AUDIO_RDP_SOURCE", SHARE_PATH "/PulseAudioRDPSource", false},
-        {"USE_VSOCK", socketFdString.c_str(), true},
-        {"WSL2_DEFAULT_APP_ICON", "/usr/share/icons/wsl/linux.png", false},
-        {"WSL2_DEFAULT_APP_OVERLAY_ICON", "/usr/share/icons/wsl/linux.png", false},
-    };
-
-    for (auto &var : variables) {
-        THROW_LAST_ERROR_IF(setenv(var.name, var.value, var.override) < 0);
-    }
-
-    SetupOptionalEnv();
+    std::string socketEnvString("USE_VSOCK=");
+    socketEnvString += socketFdString;
 
     // "ulimits -c unlimited" for core dumps.
     struct rlimit limit;
     limit.rlim_cur = RLIM_INFINITY;
     limit.rlim_max = RLIM_INFINITY;
     THROW_LAST_ERROR_IF(setrlimit(RLIMIT_CORE, &limit) < 0);
+
+    THROW_LAST_ERROR_IF(getrlimit(RLIMIT_NOFILE, &limit) < 0);
+    limit.rlim_cur = limit.rlim_max;
+    THROW_LAST_ERROR_IF(setrlimit(RLIMIT_NOFILE, &limit) < 0);
 
     // create folder to store core files.
     std::filesystem::create_directories(c_coreDir);
@@ -361,6 +401,15 @@ try {
     westonShellOption += westonShellName;
     westonShellOption += ".so";
 
+    // Construct log file option string.
+    std::string westonLogFileOption("--log=");
+    auto westonLogFilePathEnv = getenv("WSLG_WESTON_LOG_PATH");
+    if (westonLogFilePathEnv) {
+        westonLogFileOption += westonLogFilePathEnv;
+    } else {
+        westonLogFileOption += SHARE_PATH "/weston.log";
+    }
+
     // Construct logger option string.
     // By default, enable standard log and rdp-backend.
     std::string westonLoggerOption("--logger-scopes=log,rdp-backend");
@@ -384,10 +433,12 @@ try {
         westonArgs += " ";
     }
     westonArgs += "/usr/bin/weston ";
-    westonArgs += "--backend=rdp-backend.so --modules=wslgd-notify.so --xwayland --log=" SHARE_PATH "/weston.log ";
+    westonArgs += "--backend=rdp-backend.so --modules=wslgd-notify.so --xwayland ";
     westonArgs += westonSocketOption;
     westonArgs += " ";
     westonArgs += westonShellOption;
+    westonArgs += " ";
+    westonArgs += westonLogFileOption;
     westonArgs += " ";
     westonArgs += westonLoggerOption;
 
@@ -404,8 +455,12 @@ try {
                 CAP_SYS_PTRACE
             },
             std::vector<std::string>{
+                std::move(socketEnvString),
                 "WSLGD_NOTIFY_SOCKET=" WESTON_NOTIFY_SOCKET,
-                "WESTON_DISABLE_ABSTRACT_FD=1"
+                "WESTON_DISABLE_ABSTRACT_FD=1",
+                getenv("WLOG_APPENDER") ? : "", "WLOG_APPENDER=file",
+                getenv("WLOG_FILEAPPENDER_OUTPUT_FILE_NAME") ? "" : "WLOG_FILEAPPENDER_OUTPUT_FILE_NAME=wlog.log",
+                getenv("WLOG_FILEAPPENDER_OUTPUT_FILE_PATH") ? "" : "WLOG_FILEAPPENDER_OUTPUT_FILE_PATH=" SHARE_PATH
             }
         );
 
@@ -428,14 +483,18 @@ try {
         sharedMemoryObPath += sharedMemoryObDirectoryPath;
     }
 
-    std::string rdpClientExePath = c_mstscFullPath;
+    std::filesystem::path rdpClientExePath;
     bool isUseMstsc = GetEnvBool("WSLG_USE_MSTSC", false);
     if (!isUseMstsc && !wslExecutionAliasPath.empty()) {
-        std::string msrdcExePath = TranslateWindowsPath(wslExecutionAliasPath.c_str());
-        msrdcExePath += "/" MSRDC_EXE;
+        std::filesystem::path msrdcExePath = TranslateWindowsPath(wslExecutionAliasPath.c_str());
+        msrdcExePath /= MSRDC_EXE;
         if (access(msrdcExePath.c_str(), X_OK) == 0) {
             rdpClientExePath = std::move(msrdcExePath);
         }
+    }
+    if (rdpClientExePath.empty()) {
+        rdpClientExePath = c_windowsSystem32;
+        rdpClientExePath /= MSTSC_EXE;
     }
 
     std::string wslDvcPlugin;
@@ -446,16 +505,32 @@ try {
     else
         wslDvcPlugin = "/plugin:WSLDVC";
 
-    std::string rdpFilePath = wslInstallPath + "\\wslg.rdp";
+    std::string rdpFilePathArg(wslInstallPath);
+    auto rdpFile = getenv(c_rdpFileOverrideEnv);
+    if (rdpFile) {
+        if (strstr(rdpFile, "..\\") || strstr(rdpFile, "../")) {
+            LOG_ERROR("RDP file must not contain relative path (%s)", rdpFile);
+            rdpFile = nullptr;
+        }
+    }
+    rdpFilePathArg += "\\"; // Windows-style path
+    if (rdpFile) {
+        rdpFilePathArg += rdpFile;
+    } else {
+        rdpFilePathArg += c_rdpFile;
+    }
+
     monitor.LaunchProcess(std::vector<std::string>{
+        "/init",
         std::move(rdpClientExePath),
+        basename(rdpClientExePath.c_str()),
         std::move(remote),
         std::move(serviceId),
         "/silent",
         "/wslg",
         std::move(wslDvcPlugin),
         std::move(sharedMemoryObPath),
-        std::move(rdpFilePath)
+        std::move(rdpFilePathArg)
     });
 
     // Launch the system dbus daemon.
@@ -469,16 +544,29 @@ try {
         std::vector<cap_value_t>{CAP_SETGID, CAP_SETUID}
     );
 
+    // Construct pulseaudio launch command line.
+    std::string pulseaudioLaunchArgs =
+        "/usr/bin/dbus-launch "
+        "/usr/bin/pulseaudio "
+        "--load=\"module-rdp-sink sink_name=RDPSink\" "
+        "--load=\"module-rdp-source source_name=RDPSource\" "
+        "--load=\"module-native-protocol-unix socket=" SHARE_PATH "/PulseServer auth-anonymous=true\" ";
+
+    // Construct log file option string.
+    std::string pulseaudioLogFileOption("--log-target=");
+    auto pulseAudioLogFilePathEnv = getenv("WSLG_PULSEAUDIO_LOG_PATH");
+    if (pulseAudioLogFilePathEnv) {
+        pulseaudioLogFileOption += pulseAudioLogFilePathEnv;
+    } else {
+        pulseaudioLogFileOption += "file:" SHARE_PATH "/pulseaudio.log";
+    }
+    pulseaudioLaunchArgs += pulseaudioLogFileOption;
+
     // Launch pulseaudio and the associated dbus daemon.
     monitor.LaunchProcess(std::vector<std::string>{
         "/usr/bin/sh",
         "-c",
-        "/usr/bin/dbus-launch "
-        "/usr/bin/pulseaudio "
-        "--log-target=file:" SHARE_PATH "/pulseaudio.log "
-        "--load=\"module-rdp-sink sink_name=RDPSink\" "
-        "--load=\"module-rdp-source source_name=RDPSource\" "
-        "--load=\"module-native-protocol-unix socket=" SHARE_PATH "/PulseServer auth-anonymous=true\""
+        std::move(pulseaudioLaunchArgs)
     });
 
     return monitor.Run();

@@ -1,5 +1,5 @@
 # Create a builder image with the compilers, etc. needed
-FROM mcr.microsoft.com/cbl-mariner/base/core:2.0.20221010 AS build-env
+FROM mcr.microsoft.com/cbl-mariner/base/core:2.0.20230107 AS build-env
 
 # Install all the required packages for building. This list is probably
 # longer than necessary.
@@ -192,7 +192,7 @@ WORKDIR /work/vendor/pulseaudio
 RUN /usr/bin/meson --prefix=${PREFIX} build \
         --buildtype=${BUILDTYPE_NODEBUGSTRIP} \
         -Ddatabase=simple \
-        -Dbluez5=false \
+        -Ddoxygen=false \
         -Dgsettings=disabled \
         -Dtests=false && \
     ninja -C build -j8 install && \
@@ -305,7 +305,7 @@ RUN if [ -z "$SYSTEMDISTRO_DEBUG_BUILD" ] ; then \
 
 ## Create the distro image with just what's needed at runtime
 
-FROM mcr.microsoft.com/cbl-mariner/base/core:2.0.20221010 AS runtime
+FROM mcr.microsoft.com/cbl-mariner/base/core:2.0.20230107 AS runtime
 
 RUN echo "== Install Core/UI Runtime Dependencies ==" && \
     tdnf    install -y \

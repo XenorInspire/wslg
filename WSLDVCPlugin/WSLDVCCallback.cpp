@@ -7,16 +7,9 @@
 #include "WSLDVCCallback.h"
 #include "WSLDVCFileDB.h"
 
-LPCWSTR WSLG_WINDOW_ID = L"WslgServerWindowId";
-
-#ifdef WSLG_INBOX
-LPCWSTR c_WSL_exe = L"%windir%\\system32\\wsl.exe";
-LPCWSTR c_WSLg_exe = L"%windir%\\system32\\wslg.exe";
-#else
-LPCWSTR c_WSLg_exe = L"%localappdata%\\Microsoft\\WindowsApps\\MicrosoftCorporationII.WindowsSubsystemForLinux_8wekyb3d8bbwe\\wslg.exe";
-#endif // WSLG_INBOX
-
-LPCWSTR c_Working_dir = L"%windir%\\system32";
+constexpr LPCWSTR c_WSL_registry_path = L"Software\\Microsoft\\Windows\\CurrentVersion\\Lxss";
+constexpr LPCWSTR c_WSLg_window_id = L"WslgServerWindowId";
+constexpr LPCWSTR c_Working_dir = L"%windir%\\system32";
 
 //
 // This channel simply sends all the received messages back to the server. 
@@ -37,6 +30,9 @@ public:
         if (SUCCEEDED(hr))
         {
             m_spChannel = pChannel;
+
+            InitializeCriticalSection(&m_crit);
+            m_bCriticalSectionInitialized = true;
         }
         return hr;
     }
@@ -456,30 +452,29 @@ public:
         }
         DebugPrint(L"IconPath: %s\n", m_iconPath);
 
-        if (ExpandEnvironmentStringsW(c_WSLg_exe, m_expandedPathObj, ARRAYSIZE(m_expandedPathObj)) == 0)
+        // Read the registry key that declares where the WSL package is installed.
+        HKEY key;
+        hr = HRESULT_FROM_WIN32(RegOpenKeyExW(HKEY_LOCAL_MACHINE, c_WSL_registry_path, 0, KEY_READ, &key));
+        if (FAILED(hr))
         {
-            DebugPrint(L"Failed to expand WSLg exe: %s : %d\n", c_WSLg_exe, GetLastError());
+            DebugPrint(L"RegOpenKeyExW failed\n");
+            return hr;
+        }
+
+        DWORD valueSize = sizeof(m_expandedPathObj);
+        hr = HRESULT_FROM_WIN32(RegGetValueW(key, L"Msi", L"InstallLocation", (RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ), nullptr, m_expandedPathObj, &valueSize));
+        RegCloseKey(key);
+        if (FAILED(hr))
+        {
+            DebugPrint(L"RegGetValueW failed\n");
+            return hr;
+        }
+
+        if (wcscat_s(m_expandedPathObj, ARRAYSIZE(m_expandedPathObj), L"\\wslg.exe") != 0)
+        {
             return E_FAIL;
         }
         DebugPrint(L"WSLg.exe: %s\n", m_expandedPathObj);
-
-#ifdef WSLG_INBOX
-        if (!PathFileExistsW(m_expandedPathObj) || !IsFileTrusted(m_expandedPathObj))
-        {
-            if (ExpandEnvironmentStringsW(c_WSL_exe, m_expandedPathObj, ARRAYSIZE(m_expandedPathObj)) == 0)
-            {
-                DebugPrint(L"Failed to expand WSL exe: %s : %d\n", c_WSL_exe, GetLastError());
-                return E_FAIL;
-            }
-            DebugPrint(L"WSL.exe: %s\n", m_expandedPathObj);
-
-            if (!PathFileExistsW(m_expandedPathObj) || !IsFileTrusted(m_expandedPathObj))
-            {
-                DebugPrint(L"WSL.exe doesn't exists or not trustable\n");
-                return E_FAIL;
-            }
-        }
-#endif // WSLG_INBOX
 
         if (ExpandEnvironmentStringsW(c_Working_dir, m_expandedWorkingDir, ARRAYSIZE(m_expandedWorkingDir)) == 0)
         {
@@ -864,7 +859,7 @@ public:
         )
     {
         WslgWindowData* wndData = (WslgWindowData*)args;
-        HANDLE windowId = GetPropW(hwnd, WSLG_WINDOW_ID);
+        HANDLE windowId = GetPropW(hwnd, c_WSLg_window_id);
         if (windowId == (HANDLE)wndData->windowId)
         {
             UpdateTaskBarInfo(hwnd,
@@ -1005,9 +1000,15 @@ public:
         const BYTE* cur = pBuffer;
         UINT64 len = cbSize;
 
+        if (m_bChannelClosed)
+        {
+            return S_OK;
+        }
+
+        EnterCriticalSection(&m_crit);
         DebugPrint(L"OnDataReceived enter, size = %d\n", len);
 
-        while (len)
+        while (len && !m_bChannelClosed)
         {
             RDPAPPLIST_HEADER appListHeader = {};
 
@@ -1073,17 +1074,28 @@ public:
         }
 
         DebugPrint(L"OnDataReceived returns hr = %x\n", hr);
+        LeaveCriticalSection(&m_crit);
+
         return hr;
     }
 
     STDMETHODIMP 
         OnClose()
     {
+        m_bChannelClosed = true;
+
+        EnterCriticalSection(&m_crit);
+        DebugPrint(L"OnClose enter\n");
+
         // Make sure sync mode is cancelled.
         OnSyncEnd(false);
 
         m_spFileDB->OnClose();
         m_spFileDB = nullptr;
+
+        DebugPrint(L"OnClose returns hr = %x\n", S_OK);
+        LeaveCriticalSection(&m_crit);
+
         return S_OK;
     }
 
@@ -1092,6 +1104,10 @@ protected:
     virtual 
         ~WSLDVCCallback() 
     {
+        if (m_bCriticalSectionInitialized)
+        {
+            DeleteCriticalSection(&m_crit);
+        }
     }
 
 private:
@@ -1101,6 +1117,10 @@ private:
     ComPtr<IWSLDVCFileDB> m_spFileDB;
     ComPtr<IWSLDVCFileDB> m_spFileDBSync; // valid only during sync.
 
+    CRITICAL_SECTION m_crit = {};
+    bool m_bCriticalSectionInitialized = false;
+
+    bool m_bChannelClosed = false;
     bool m_handShakeComplated = false;
 
     RDPAPPLIST_SERVER_CAPS_PDU m_serverCaps = {};
